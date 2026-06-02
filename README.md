@@ -135,28 +135,6 @@ tor_relay_or_addresses.csv
 tor_relay_or_addresses.json
 ```
 
-这些是运行产物，已经被 `.gitignore` 排除，不建议上传到 GitHub。
-
-## 低误报匹配建议
-
-推荐强判条件：
-
-```text
-目的 IP 命中当前 or_addresses.ip
-+ 目的端口命中当前 or_addresses.port
-+ 连接方向为用户侧主动外联
-+ 连接行为符合 Tor 长连接 / 稳定重连模式
-```
-
-不建议只用以下单一特征判定：
-
-```text
-只命中 IP
-只命中端口 443/9001
-只有长连接
-只有 TLS
-只有无 DNS 对应关系
-```
 
 ## 数据来源
 
@@ -166,21 +144,6 @@ TORFINDER 使用 Tor Metrics Onionoo details API：
 https://onionoo.torproject.org/details?type=relay&running=true
 ```
 
-## GitHub 上传说明
-
-建议上传以下文件：
-
-```text
-tor_relay_cli.py
-start_torfinder.bat
-启动Tor爬虫.bat
-README.md
-requirements.txt
-LICENSE
-.gitignore
-```
-
-不要上传运行生成的数据库、CSV/JSON 导出文件和 `__pycache__`。
 
 ## License
 
