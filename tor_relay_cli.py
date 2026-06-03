@@ -14,6 +14,7 @@ import csv
 import ipaddress
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -32,8 +33,14 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_DB = APP_DIR / "tor_relays.sqlite3"
+DATA_DIR = APP_DIR / "data"
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
+DIFF_DIR = DATA_DIR / "diffs"
+LEGACY_DB = APP_DIR / "tor_relays.sqlite3"
+DEFAULT_DB = DATA_DIR / "tor_relays.sqlite3"
 LOGO_WIDTH = 94
+DEFAULT_RETRIES = 3
+DEFAULT_PROXY = os.environ.get("TORFINDER_PROXY", "").strip()
 DEFAULT_API_URL = (
     "https://onionoo.torproject.org/details"
     "?type=relay&running=true"
@@ -73,9 +80,79 @@ def default_export_path(export_format: str = "csv") -> Path:
     return Path.cwd() / f"tor_relay_or_addresses.{export_format}"
 
 
+def ensure_runtime_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    DIFF_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def maybe_copy_legacy_db(db_path: Path) -> None:
+    if db_path != DEFAULT_DB or db_path.exists() or not LEGACY_DB.exists():
+        return
+
+    ensure_runtime_dirs()
+    shutil.copy2(LEGACY_DB, db_path)
+    for suffix in ("-wal", "-shm"):
+        legacy_sidecar = Path(str(LEGACY_DB) + suffix)
+        target_sidecar = Path(str(db_path) + suffix)
+        if legacy_sidecar.exists() and not target_sidecar.exists():
+            shutil.copy2(legacy_sidecar, target_sidecar)
+
+
 def log_event(message: str, level: str = "INFO") -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
+
+
+def normalize_proxy(proxy_url: str | None) -> str | None:
+    if not proxy_url:
+        return None
+    value = proxy_url.strip()
+    return value or None
+
+
+def log_proxy_setting(proxy_url: str | None) -> None:
+    proxy_url = normalize_proxy(proxy_url)
+    if proxy_url:
+        log_event(f"网络代理：{proxy_url}")
+    else:
+        log_event("网络代理：未指定，将直连或使用系统 HTTPS_PROXY/HTTP_PROXY 环境变量。")
+
+
+def make_json_request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; TORFINDER/1.1; local research tool)",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        },
+    )
+
+
+def build_url_opener(proxy_url: str | None) -> urllib.request.OpenerDirector | None:
+    proxy_url = normalize_proxy(proxy_url)
+    if not proxy_url:
+        return None
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler(
+            {
+                "http": proxy_url,
+                "https": proxy_url,
+            }
+        )
+    )
+
+
+def data_source_failure(exc: BaseException, attempts: int, proxy_url: str | None) -> urllib.error.URLError:
+    reason = getattr(exc, "reason", exc)
+    proxy_url = normalize_proxy(proxy_url)
+    if proxy_url:
+        hint = f"已使用代理 {proxy_url}，仍失败；请确认该代理能访问 HTTPS 外网。"
+    else:
+        hint = "当前网络直连 Onionoo 可能被拦截、超时或重置；可使用 --proxy http://127.0.0.1:7890 或设置 TORFINDER_PROXY。"
+    return urllib.error.URLError(f"{reason}；已尝试 {attempts} 次；{hint}")
 
 
 def print_logo() -> None:
@@ -205,8 +282,8 @@ def handle_runtime_error(exc: Exception, db_path: Path) -> None:
             f"错误原因：{exc}\n\n"
             "建议检查：\n"
             "  1. 当前网络是否可以访问 https://onionoo.torproject.org\n"
-            "  2. 是否需要代理或放行网络访问权限\n"
-            "  3. 稍后重新选择“立即同步”",
+            "  2. 如果直连失败，使用命令行代理：python .\\tor_relay_cli.py sync --proxy http://127.0.0.1:7890\n"
+            "  3. 或设置环境变量 TORFINDER_PROXY 后重新选择“立即同步”",
         )
     elif isinstance(exc, sqlite3.Error):
         print_runtime_error(
@@ -221,7 +298,13 @@ def handle_runtime_error(exc: Exception, db_path: Path) -> None:
         print_runtime_error("程序执行失败", f"错误原因：{exc}")
 
 
-def interactive_menu(db_path: Path = DEFAULT_DB, api_url: str = DEFAULT_API_URL, timeout: int = 30) -> int:
+def interactive_menu(
+    db_path: Path = DEFAULT_DB,
+    api_url: str = DEFAULT_API_URL,
+    timeout: int = 30,
+    retries: int = DEFAULT_RETRIES,
+    proxy_url: str | None = DEFAULT_PROXY,
+) -> int:
     selected_index = 0
     while True:
         choice, selected_index = select_menu_choice(selected_index)
@@ -245,9 +328,10 @@ def interactive_menu(db_path: Path = DEFAULT_DB, api_url: str = DEFAULT_API_URL,
                     print_logo()
                     log_event("开始同步 Tor Relay 地址库。")
                     log_event(f"数据源：{api_url}")
-                    result = sync_relays(conn, api_url, timeout)
-                    log_event(f"同步完成：{result.relays} 个 relay，{result.addresses} 个 OR 地址。")
-                    log_event(f"数据库路径：{db_path}")
+                    log_event(f"网络请求最大尝试次数：{retries}")
+                    log_proxy_setting(proxy_url)
+                    result = sync_relays(conn, api_url, timeout, retries, proxy_url)
+                    log_sync_result(result, db_path)
                 elif choice == "3":
                     print_logo()
                     log_event("开始读取数据库统计信息。")
@@ -301,7 +385,14 @@ def interactive_menu(db_path: Path = DEFAULT_DB, api_url: str = DEFAULT_API_URL,
                 elif choice == "7":
                     print_logo()
                     interval = prompt_int("同步间隔，单位秒", 3600, 10)
-                    args = argparse.Namespace(api_url=api_url, timeout=timeout, interval=interval)
+                    args = argparse.Namespace(
+                        api_url=api_url,
+                        timeout=timeout,
+                        retries=retries,
+                        proxy=proxy_url,
+                        interval=interval,
+                        db=db_path,
+                    )
                     log_event(f"启动动态循环更新：interval={interval}s")
                     run_loop(conn, args)
                 elif choice == "8":
@@ -399,6 +490,8 @@ def utc_now() -> str:
 
 
 def connect_db(db_path: Path) -> sqlite3.Connection:
+    if db_path == DEFAULT_DB:
+        maybe_copy_legacy_db(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -463,17 +556,32 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def fetch_json(url: str, timeout: int) -> dict[str, Any]:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "tor-relay-cli/1.0 (+local research tool)",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return json.loads(resp.read().decode(charset))
+def fetch_json(
+    url: str,
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
+    proxy_url: str | None = None,
+) -> dict[str, Any]:
+    attempts = max(1, retries)
+    opener = build_url_opener(proxy_url)
+    for attempt in range(1, attempts + 1):
+        try:
+            req = make_json_request(url)
+            open_url = opener.open if opener else urllib.request.urlopen
+            with open_url(req, timeout=timeout) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return json.loads(resp.read().decode(charset))
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt >= attempts:
+                raise data_source_failure(exc, attempts, proxy_url) from exc
+            delay = min(2 * attempt, 8)
+            log_event(
+                f"数据源请求失败，{delay} 秒后重试（第 {attempt}/{attempts} 次）：{exc}",
+                "WARN",
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("数据源请求失败，且没有可用响应。")
 
 
 def parse_or_address(value: str) -> tuple[str, int, int] | None:
@@ -509,9 +617,254 @@ class SyncResult:
     addresses: int
     started_at: str
     completed_at: str
+    snapshot_path: Path | None = None
+    previous_snapshot_path: Path | None = None
+    diff_csv_path: Path | None = None
+    diff_json_path: Path | None = None
+    added_count: int = 0
+    removed_count: int = 0
+    port_changed_count: int = 0
 
 
-def sync_relays(conn: sqlite3.Connection, api_url: str, timeout: int) -> SyncResult:
+def timestamp_for_filename(value: str | None = None) -> str:
+    if value:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                parsed = datetime.strptime(value.replace("Z", ""), fmt)
+                return parsed.strftime("%Y%m%d_%H%M%S")
+            except ValueError:
+                pass
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def current_address_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT a.ip, a.port, a.ip_version, r.fingerprint, r.nickname, r.country,
+               r.country_name, r.as_number, r.as_name, r.flags_json, a.last_seen_at
+        FROM or_addresses a
+        JOIN relays r ON r.fingerprint = a.fingerprint
+        WHERE a.is_current = 1
+        ORDER BY a.ip_version, a.ip, a.port
+        """
+    ).fetchall()
+
+
+def snapshot_columns() -> list[str]:
+    return [
+        "fingerprint",
+        "ip",
+        "port",
+        "ip_version",
+        "nickname",
+        "country",
+        "country_name",
+        "as_number",
+        "as_name",
+        "flags",
+        "last_seen_at_utc",
+    ]
+
+
+def write_current_snapshot(conn: sqlite3.Connection, run_id: int, completed_at: str) -> Path:
+    ensure_runtime_dirs()
+    timestamp = timestamp_for_filename(completed_at)
+    output = SNAPSHOT_DIR / f"tor_relays_{timestamp}_run{run_id}.csv"
+    rows = current_address_rows(conn)
+
+    with output.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=snapshot_columns())
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "fingerprint": row["fingerprint"],
+                    "ip": row["ip"],
+                    "port": row["port"],
+                    "ip_version": row["ip_version"],
+                    "nickname": row["nickname"] or "",
+                    "country": row["country"] or "",
+                    "country_name": row["country_name"] or "",
+                    "as_number": row["as_number"] or "",
+                    "as_name": row["as_name"] or "",
+                    "flags": ",".join(json.loads(row["flags_json"] or "[]")),
+                    "last_seen_at_utc": row["last_seen_at"] or "",
+                }
+            )
+
+    return output
+
+
+def find_previous_snapshot(current_snapshot: Path) -> Path | None:
+    if not SNAPSHOT_DIR.exists():
+        return None
+    snapshots = sorted(
+        (path for path in SNAPSHOT_DIR.glob("tor_relays_*.csv") if path != current_snapshot),
+        key=lambda path: path.stat().st_mtime,
+    )
+    return snapshots[-1] if snapshots else None
+
+
+def read_snapshot(path: Path) -> dict[tuple[str, str, str], dict[str, str]]:
+    rows: dict[tuple[str, str, str], dict[str, str]] = {}
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            key = (row.get("fingerprint", ""), row.get("ip", ""), row.get("port", ""))
+            if all(key):
+                rows[key] = dict(row)
+    return rows
+
+
+def address_identity(row: dict[str, str]) -> tuple[str, str]:
+    return row.get("fingerprint", ""), row.get("ip", "")
+
+
+def analyze_snapshot_diff(
+    previous_snapshot: Path | None,
+    current_snapshot: Path,
+    run_id: int,
+    completed_at: str,
+) -> tuple[Path | None, Path | None, int, int, int]:
+    if previous_snapshot is None:
+        return None, None, 0, 0, 0
+
+    ensure_runtime_dirs()
+    previous_rows = read_snapshot(previous_snapshot)
+    current_rows = read_snapshot(current_snapshot)
+
+    previous_keys = set(previous_rows)
+    current_keys = set(current_rows)
+    added_keys = sorted(current_keys - previous_keys)
+    removed_keys = sorted(previous_keys - current_keys)
+
+    previous_by_identity: dict[tuple[str, str], set[str]] = {}
+    current_by_identity: dict[tuple[str, str], set[str]] = {}
+    for row in previous_rows.values():
+        previous_by_identity.setdefault(address_identity(row), set()).add(row.get("port", ""))
+    for row in current_rows.values():
+        current_by_identity.setdefault(address_identity(row), set()).add(row.get("port", ""))
+
+    port_changes: list[dict[str, str]] = []
+    port_changed_identities: set[tuple[str, str]] = set()
+    for identity in sorted(set(previous_by_identity) & set(current_by_identity)):
+        old_ports = previous_by_identity[identity]
+        new_ports = current_by_identity[identity]
+        if old_ports != new_ports:
+            port_changed_identities.add(identity)
+            sample_row = next(
+                row for row in current_rows.values()
+                if address_identity(row) == identity
+            )
+            port_changes.append(
+                {
+                    "change_type": "port_changed",
+                    "fingerprint": identity[0],
+                    "ip": identity[1],
+                    "port": "",
+                    "ip_version": sample_row.get("ip_version", ""),
+                    "country_name": sample_row.get("country_name", ""),
+                    "as_number": sample_row.get("as_number", ""),
+                    "flags": sample_row.get("flags", ""),
+                    "last_seen_at_utc": sample_row.get("last_seen_at_utc", ""),
+                    "old_ports": ",".join(sorted(old_ports)),
+                    "new_ports": ",".join(sorted(new_ports)),
+                    "nickname": sample_row.get("nickname", ""),
+                    "country": sample_row.get("country", ""),
+                    "as_name": sample_row.get("as_name", ""),
+                }
+            )
+
+    diff_rows: list[dict[str, str]] = []
+    filtered_added_keys = [
+        key for key in added_keys if (key[0], key[1]) not in port_changed_identities
+    ]
+    filtered_removed_keys = [
+        key for key in removed_keys if (key[0], key[1]) not in port_changed_identities
+    ]
+
+    for key in filtered_added_keys:
+        row = current_rows[key]
+        diff_rows.append(
+            {
+                "change_type": "added",
+                **{column: row.get(column, "") for column in snapshot_columns()},
+                "old_ports": "",
+                "new_ports": row.get("port", ""),
+            }
+        )
+    for key in filtered_removed_keys:
+        row = previous_rows[key]
+        diff_rows.append(
+            {
+                "change_type": "removed",
+                **{column: row.get(column, "") for column in snapshot_columns()},
+                "old_ports": row.get("port", ""),
+                "new_ports": "",
+            }
+        )
+    diff_rows.extend(port_changes)
+
+    timestamp = timestamp_for_filename(completed_at)
+    base_name = f"diff_{previous_snapshot.stem}_to_{current_snapshot.stem}_{timestamp}_run{run_id}"
+    csv_path = DIFF_DIR / f"{base_name}.csv"
+    json_path = DIFF_DIR / f"{base_name}.json"
+    diff_columns = [
+        "change_type",
+        *snapshot_columns(),
+        "old_ports",
+        "new_ports",
+    ]
+
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=diff_columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(diff_rows)
+
+    summary = {
+        "previous_snapshot": str(previous_snapshot),
+        "current_snapshot": str(current_snapshot),
+        "added_count": len(filtered_added_keys),
+        "removed_count": len(filtered_removed_keys),
+        "port_changed_count": len(port_changes),
+        "diff_csv": str(csv_path),
+    }
+    json_path.write_text(
+        json.dumps({"summary": summary, "changes": diff_rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return csv_path, json_path, len(filtered_added_keys), len(filtered_removed_keys), len(port_changes)
+
+
+def log_sync_result(result: SyncResult, db_path: Path) -> None:
+    log_event(f"同步完成：{result.relays} 个 relay，{result.addresses} 个 OR 地址。")
+    log_event(f"数据库路径：{db_path}")
+    if result.snapshot_path:
+        log_event(f"本次快照文件：{result.snapshot_path}")
+    if result.previous_snapshot_path:
+        log_event(f"对比上一份快照：{result.previous_snapshot_path}")
+        log_event(
+            "差异分析结果："
+            f"新增={result.added_count}，"
+            f"移除={result.removed_count}，"
+            f"端口变化={result.port_changed_count}"
+        )
+        if result.diff_csv_path:
+            log_event(f"差异 CSV：{result.diff_csv_path}")
+        if result.diff_json_path:
+            log_event(f"差异 JSON：{result.diff_json_path}")
+    else:
+        log_event("本次为首个快照，暂无上一份快照可对比。")
+
+
+def sync_relays(
+    conn: sqlite3.Connection,
+    api_url: str,
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
+    proxy_url: str | None = None,
+) -> SyncResult:
     init_db(conn)
     started_at = utc_now()
     run_id = conn.execute(
@@ -521,7 +874,7 @@ def sync_relays(conn: sqlite3.Connection, api_url: str, timeout: int) -> SyncRes
     conn.commit()
 
     try:
-        payload = fetch_json(api_url, timeout)
+        payload = fetch_json(api_url, timeout, retries, proxy_url)
         relays = payload.get("relays", [])
         if not isinstance(relays, list):
             raise ValueError("Onionoo 响应中 relays 字段不是列表")
@@ -530,6 +883,7 @@ def sync_relays(conn: sqlite3.Connection, api_url: str, timeout: int) -> SyncRes
         address_count = 0
 
         with conn:
+            conn.execute("UPDATE relays SET running = 0, updated_at = ?", (now,))
             conn.execute("UPDATE or_addresses SET is_current = 0, updated_at = ?", (now,))
 
             for relay in relays:
@@ -610,16 +964,43 @@ def sync_relays(conn: sqlite3.Connection, api_url: str, timeout: int) -> SyncRes
                     )
 
             completed_at = utc_now()
+            snapshot_path = write_current_snapshot(conn, int(run_id), completed_at)
+            previous_snapshot_path = find_previous_snapshot(snapshot_path)
+            diff_csv_path, diff_json_path, added_count, removed_count, port_changed_count = analyze_snapshot_diff(
+                previous_snapshot_path,
+                snapshot_path,
+                int(run_id),
+                completed_at,
+            )
+            if previous_snapshot_path:
+                message = (
+                    "同步完成；"
+                    f"新增={added_count}；移除={removed_count}；端口变化={port_changed_count}"
+                )
+            else:
+                message = "同步完成；已生成首个快照，暂无上一份快照可对比"
             conn.execute(
                 """
                 UPDATE sync_runs
                 SET completed_at = ?, status = ?, relay_count = ?, address_count = ?, message = ?
                 WHERE id = ?
                 """,
-                (completed_at, "success", len(relays), address_count, "同步完成", run_id),
+                (completed_at, "success", len(relays), address_count, message, run_id),
             )
 
-        return SyncResult(len(relays), address_count, started_at, completed_at)
+        return SyncResult(
+            len(relays),
+            address_count,
+            started_at,
+            completed_at,
+            snapshot_path,
+            previous_snapshot_path,
+            diff_csv_path,
+            diff_json_path,
+            added_count,
+            removed_count,
+            port_changed_count,
+        )
     except Exception as exc:
         completed_at = utc_now()
         with conn:
@@ -822,17 +1203,17 @@ def export_addresses(conn: sqlite3.Connection, args: argparse.Namespace) -> None
 
 def run_loop(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print(f"开始动态更新：每 {args.interval} 秒同步一次。按 Ctrl+C 停止。")
+    db_path = getattr(args, "db", DEFAULT_DB)
+    retries = getattr(args, "retries", DEFAULT_RETRIES)
+    proxy_url = getattr(args, "proxy", DEFAULT_PROXY)
     while True:
         try:
-            result = sync_relays(conn, args.api_url, args.timeout)
-            print(
-                f"[{result.completed_at} UTC] 同步成功："
-                f"{result.relays} 个 relay，{result.addresses} 个 OR 地址"
-            )
+            result = sync_relays(conn, args.api_url, args.timeout, retries, proxy_url)
+            log_sync_result(result, db_path)
         except (urllib.error.URLError, TimeoutError) as exc:
-            print(f"[{utc_now()} UTC] 网络请求失败：{exc}")
+            log_event(f"网络请求失败：{exc}", "ERROR")
         except Exception as exc:
-            print(f"[{utc_now()} UTC] 同步失败：{exc}")
+            log_event(f"同步失败：{exc}", "ERROR")
 
         time.sleep(args.interval)
 
@@ -845,6 +1226,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite 数据库路径")
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Onionoo API 地址")
     parser.add_argument("--timeout", type=int, default=30, help="网络请求超时时间，单位秒")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="网络请求失败后的最大尝试次数")
+    parser.add_argument(
+        "--proxy",
+        default=DEFAULT_PROXY,
+        help="网络代理，例如 http://127.0.0.1:7890；也可设置 TORFINDER_PROXY 环境变量",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -853,9 +1240,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_parser = subparsers.add_parser("sync", help="立即同步 Tor relay 数据")
     sync_parser.add_argument("--quiet", action="store_true", help="只输出最少信息")
+    sync_parser.add_argument(
+        "--retries",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="网络请求失败后的最大尝试次数",
+    )
+    sync_parser.add_argument(
+        "--proxy",
+        default=argparse.SUPPRESS,
+        help="网络代理，例如 http://127.0.0.1:7890",
+    )
 
     loop_parser = subparsers.add_parser("loop", help="循环动态更新")
     loop_parser.add_argument("--interval", type=int, default=3600, help="同步间隔，单位秒")
+    loop_parser.add_argument(
+        "--retries",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="网络请求失败后的最大尝试次数",
+    )
+    loop_parser.add_argument(
+        "--proxy",
+        default=argparse.SUPPRESS,
+        help="网络代理，例如 http://127.0.0.1:7890",
+    )
 
     list_parser = subparsers.add_parser("list", help="列出当前 OR 地址")
     list_parser.add_argument("--country", help="按国家/地区代码过滤，例如 us、de、cn")
@@ -893,12 +1302,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "sync":
             log_event("开始同步 Tor Relay 地址库。")
             log_event(f"数据源：{args.api_url}")
-            result = sync_relays(conn, args.api_url, args.timeout)
+            log_event(f"网络请求最大尝试次数：{args.retries}")
+            log_proxy_setting(args.proxy)
+            result = sync_relays(conn, args.api_url, args.timeout, args.retries, args.proxy)
             if not args.quiet:
-                log_event(f"同步完成：{result.relays} 个 relay，{result.addresses} 个 OR 地址。")
-                log_event(f"数据库路径：{args.db}")
+                log_sync_result(result, args.db)
         elif args.command == "loop":
             log_event(f"启动动态循环更新：interval={args.interval}s")
+            log_proxy_setting(args.proxy)
             run_loop(conn, args)
         elif args.command == "stats":
             log_event("开始读取数据库统计信息。")
@@ -938,8 +1349,8 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print("建议检查：")
         print("  1. 当前网络是否可以访问 https://onionoo.torproject.org")
-        print("  2. 是否需要代理或放行网络访问权限")
-        print("  3. 稍后重试：python .\\tor_relay_cli.py sync")
+        print("  2. 如果直连失败，使用代理：python .\\tor_relay_cli.py sync --proxy http://127.0.0.1:7890")
+        print("  3. 或设置环境变量 TORFINDER_PROXY 后重试")
         return 1
     except sqlite3.Error as exc:
         log_event("数据库操作失败。", "ERROR")
